@@ -29,11 +29,12 @@ At idle (Tctl 40-45 °C) that is about 650-700 rpm on the radiator fans and abou
 
 ### Things learned about the K360
 
-- The cooler stores **4 points per channel**, not 7: the driver accepts 7, but the device reads back zeros for the rest.
+- The cooler keeps **4 points per channel** on this unit, not the 7 that the driver and liquidctl's protocol notes describe. A raw write of 7 points reads back as 4 points plus zeros, and the fans stayed at the 4th point's duty at temperatures above it. So this comes from the device, not from the driver; I have only tried one unit.
 - **Above the last point the cooler holds that point's duty.** A curve that does not end at 100 % would stop cooling harder at high temperature. The script refuses to start with such a curve.
 - Hardware limits: radiator fans 20-100 %, pump 60-100 %, water block fan 0-100 %.
 - The cooler slews on its own, about +4 %/s up and about -1.5 %/s down, and it keeps using the last temperature it was sent.
-- liquidctl 1.15's `set_speed_profile` appears to pass the (temperature, duty) pairs to the device in swapped order. This was only read from the code and not tried on hardware through the public function. That is why the script writes the configuration with the low-level `set_fan_config` / `set_fan_temp_config` and reads it back to verify it. This also makes it depend on private names (`_FanConfig`, `_FanMode`, `_FanTempConfig`) of liquidctl, so pin the version you tested.
+- **liquidctl 1.15 stores the profile with temperature and duty swapped.** The CLI, the guide and `yoda` use (temperature, duty) pairs, but `MpgCooler.set_speed_profile` and `set_profiles` unpack (duty, temperature). Checked on this cooler: `liquidctl set fans speed 30 25 50 40 70 70 90 100` (30 °C to 25 %, ..., 90 °C to 100 %) stores the duties 30, 50, 70, 90 and the temperatures 25, 40, 70, 100, and the fans only reach 90 % at 100 °C. The same two lines are still in liquidctl's `main`. With the order fixed in a patched copy, the same command stores what it says. The example in the guide, with 5 pairs, would also lose its 5th pair on this cooler.
+- That is why the script writes the configuration with the low-level `set_fan_config` / `set_fan_temp_config` and reads it back to verify it. It depends on private names (`_FanConfig`, `_FanMode`, `_FanTempConfig`) of liquidctl, so pin the version you tested. If liquidctl fixes the order, the script keeps working, because it does not use `set_speed_profile`.
 
 ### Load bursts
 
