@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Temperature-driven fan and pump curves for the MSI MPG CoreLiquid K360.
+
+The cooler stores up to 4 (temperature, duty) points per channel and
+interpolates them itself, but it has no sensor of its own: it follows whatever
+CPU temperature the host last sent (what MSI Center does under Windows).  This
+service programs the curves, then keeps feeding it the CPU temperature (Tctl)
+and frequency, and puts those values on the cooler's display.
+
+Other programs should not talk to the cooler while this runs (replies get
+mixed up); read /run/msi-aio-fancontrol/status.json instead.
+
+Uses liquidctl's Python API (Debian package `liquidctl`, version 1.15.x).
+"""
+
+import argparse
+import glob
+import json
+import logging
+import math
+import os
+import signal
+import sys
+import time
+
+from liquidctl.driver import find_liquidctl_devices
+from liquidctl.driver.msi import _FanConfig, _FanMode, _FanTempConfig
+
+# Channel indexes of the K360 driver: 0-2 radiator fans, 3 water block fan, 4 pump.
+# 4 points each as (CPU temperature in degC, duty in %), interpolated linearly by
+# the cooler: gentle at low temperature, steeper towards the top.  The cooler
+# stores only 4 points and holds the last duty above the last temperature, so the
+# last point must be 100 %.  Hardware limits: radiator fans 20-100 %, pump 60-100 %
+# (the device refuses to go lower), water block fan 0-100 %.
+FANS = [(40, 25), (58, 35), (72, 60), (85, 100)]
+WATERBLOCK = [(40, 30), (58, 38), (72, 60), (85, 100)]
+PUMP = [(40, 60), (58, 68), (72, 86), (85, 100)]
+CURVES = {0: FANS, 1: FANS, 2: FANS, 3: WATERBLOCK, 4: PUMP}
+MIN_DUTY = {0: 20, 1: 20, 2: 20, 3: 0, 4: 60}
+
+# What the display shows (any of: cpu_temp, cpu_freq, gpu_freq, gpu_usage,
+# fan_pump, fan_radiator, fan_cpumos).  The temperature shown is the filtered one.
+DISPLAY = ["cpu_temp", "cpu_freq", "fan_radiator"]
+
+# The CPU temperature is low-pass filtered before it reaches the curves, so that
+# a burst of a second or two barely moves the fans, while a sustained load still
+# gets full cooling within seconds.  Time constants of the first-order filter.
+# The cooler adds its own slew (about +4 %/s up, -1.5 %/s down), and the CPU
+# temperature itself needs ~20 s to settle after a burst, so a long TAU_DOWN
+# would only make the fans linger.
+TAU_UP = 10.0  # seconds, temperature rising
+TAU_DOWN = 3.0  # seconds, temperature falling
+
+SAMPLE = 0.5  # seconds between CPU temperature readings
+SEND = 1.0  # seconds between updates to the cooler
+STATUS = 2.0  # seconds between status file updates
+CHECK = 30  # verify the stored curves this often (power loss, resume)
+SAFE_TEMP = 80  # reported when the service stops: fans/pump stay strong
+FAIL_TEMP = 90  # reported when the CPU temperature cannot be read
+RECONNECT_AFTER = 3  # consecutive failures before reconnecting
+MAX_FAILURES = 20  # consecutive failures before exiting (systemd restarts us)
+STATUS_FILE = "/run/msi-aio-fancontrol/status.json"
+
+log = logging.getLogger("msi-aio-fancontrol")
+
+
+def check_curves():
+    for ch, points in CURVES.items():
+        temps = [t for t, _ in points]
+        duties = [d for _, d in points]
+        assert len(points) == 4, f"channel {ch}: exactly 4 points required"
+        assert temps == sorted(set(temps)), f"channel {ch}: temperatures must rise"
+        assert duties == sorted(duties), f"channel {ch}: duties must not fall"
+        assert duties[-1] == 100, f"channel {ch}: last point must be 100 %"
+        assert min(duties) >= MIN_DUTY[ch] and max(duties) <= 100, f"channel {ch}: duty range"
+
+
+def find_cpu_temp_file():
+    for name in glob.glob("/sys/class/hwmon/hwmon*/name"):
+        with open(name) as f:
+            if f.read().strip() == "k10temp":
+                return name.replace("/name", "/temp1_input")  # temp1 is Tctl
+    raise RuntimeError("k10temp sensor not found")
+
+
+def read_cpu_temp(path):
+    with open(path) as f:
+        return int(f.read()) / 1000
+
+
+def read_cpu_freq_mhz():
+    freqs = []
+    for path in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"):
+        try:
+            with open(path) as f:
+                freqs.append(int(f.read()))
+        except OSError:
+            pass  # core offline
+    return sum(freqs) / len(freqs) / 1000 if freqs else 0
+
+
+def desired_config():
+    fan_cfg, temp_cfg = [], []
+    for ch in range(5):
+        temps = [t for t, _ in CURVES[ch]]
+        duties = [d for _, d in CURVES[ch]]
+        fan_cfg.append(_FanConfig(_FanMode.CUSTOMIZE.value, *duties, 0, 0, 0))
+        temp_cfg.append(_FanTempConfig(_FanMode.CUSTOMIZE.value, *temps, 0, 0, 0))
+    return fan_cfg, temp_cfg
+
+
+def interpolate(points, temp):
+    if temp <= points[0][0]:
+        return points[0][1]
+    for (t0, d0), (t1, d1) in zip(points, points[1:]):
+        if temp <= t1:
+            return d0 + (d1 - d0) * (temp - t0) / (t1 - t0)
+    return points[-1][1]
+
+
+def open_device():
+    for dev in find_liquidctl_devices():
+        if dev.vendor_id == 0x0DB0 and dev.product_id == 0xB130:
+            dev.connect()
+            return dev
+    raise RuntimeError("MSI MPG CoreLiquid K360 (0db0:b130) not found")
+
+
+def curves_applied(dev):
+    fan_cfg, temp_cfg = desired_config()
+    return list(dev.get_fan_config()) == fan_cfg and list(dev.get_fan_temp_config()) == temp_cfg
+
+
+def apply_curves(dev):
+    fan_cfg, temp_cfg = desired_config()
+    dev._fan_cfg, dev._fan_temp_cfg = fan_cfg, temp_cfg
+    dev.set_fan_config(fan_cfg)
+    dev.set_fan_temp_config(temp_cfg)
+    if not curves_applied(dev):
+        raise RuntimeError("cooler did not accept the curves (read-back mismatch)")
+    log.info("curves programmed")
+    try:
+        dev.set_oled_show_hardware_monitor(DISPLAY)
+    except Exception as exc:  # the display must never get in the way of cooling
+        log.warning("could not set up the display: %s", exc)
+
+
+def send_temp(dev, temp, freq_mhz=0):
+    dev.set_oled_show_cpu_status(round(freq_mhz), round(temp))
+
+
+def read_status(dev):
+    s = {k: v for k, v, _ in dev.get_status()}
+    return {
+        "radiator_fan_duty": s["Fan 1 duty"],
+        "radiator_fan_rpm": s["Fan 1 speed"],
+        "waterblock_duty": s["Water block duty"],
+        "waterblock_rpm": s["Water block speed"],
+        "pump_duty": s["Pump duty"],
+        "pump_rpm": s["Pump speed"],
+    }
+
+
+def write_status_file(data):
+    try:
+        tmp = STATUS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, STATUS_FILE)
+    except OSError as exc:
+        log.debug("cannot write status file: %s", exc)
+
+
+def run(args):
+    path = find_cpu_temp_file()
+    dev = None if args.dry_run else open_device()
+    if dev:
+        apply_curves(dev)
+    stopping = []
+    signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stopping.append(1))
+
+    filtered = read_cpu_temp(path)
+    raw = filtered
+    last = time.monotonic()
+    last_send = last_status = last_check = 0.0
+    failures = 0
+    while not stopping:
+        now = time.monotonic()
+        try:
+            try:
+                raw = read_cpu_temp(path)
+            except OSError:
+                raw = FAIL_TEMP
+                log.warning("cannot read CPU temperature, assuming %s", FAIL_TEMP)
+            tau = TAU_UP if raw > filtered else TAU_DOWN
+            filtered += (raw - filtered) * (1 - math.exp(-(now - last) / tau))
+            last = now
+
+            if dev and now - last_send >= SEND:
+                last_send = now
+                send_temp(dev, filtered, read_cpu_freq_mhz())
+            if now - last_status >= STATUS:
+                last_status = now
+                status = read_status(dev) if dev else {}
+                status.update(time=time.time(), tctl=round(raw, 1), control_temp=round(filtered, 1))
+                write_status_file(status)
+                if args.verbose:
+                    log.info("Tctl %.1f filtered %.1f | %s", raw, filtered, status)
+            if dev and now - last_check >= CHECK:
+                last_check = now
+                if not curves_applied(dev):
+                    log.warning("curves missing on the cooler (power loss or resume?), reprogramming")
+                    apply_curves(dev)
+            failures = 0
+        except Exception as exc:  # USB hiccups, device re-enumeration after resume
+            failures += 1
+            log.error("update failed (%d/%d): %s", failures, MAX_FAILURES, exc)
+            if failures >= MAX_FAILURES:
+                return 1  # let systemd restart us
+            if failures >= RECONNECT_AFTER:
+                try:
+                    dev.disconnect()
+                except Exception:
+                    pass
+                try:
+                    dev = open_device()
+                    apply_curves(dev)
+                except Exception as exc2:
+                    log.error("reconnect failed: %s", exc2)
+        time.sleep(SAMPLE)
+
+    if dev:
+        try:
+            send_temp(dev, SAFE_TEMP, read_cpu_freq_mhz())  # the cooler keeps the last temperature
+            dev.disconnect()
+        except Exception:
+            pass
+        log.info("stopped, cooler left at the %s degC operating point", SAFE_TEMP)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("-v", "--verbose", action="store_true", help="log every status update")
+    ap.add_argument("--dry-run", action="store_true", help="read the CPU temperature only, never touch the cooler")
+    ap.add_argument("--show-curves", action="store_true", help="print the curves and exit")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    check_curves()
+
+    if args.show_curves:
+        for name, pts in (("radiator fans", FANS), ("water block fan", WATERBLOCK), ("pump", PUMP)):
+            print(f"{name:16}", "  ".join(f"{t}C:{d}%" for t, d in pts))
+        return 0
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,19 @@
+[Unit]
+Description=Temperature-driven fan and pump curves for the MSI MPG CoreLiquid K360
+Documentation=https://github.com/liquidctl/liquidctl/blob/main/docs/msi-mpg-coreliquid-guide.md
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/msi-aio-fancontrol
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+RuntimeDirectory=msi-aio-fancontrol
+RuntimeDirectoryMode=0755
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
