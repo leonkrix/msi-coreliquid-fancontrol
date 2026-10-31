@@ -8,7 +8,7 @@ import glob, json, multiprocessing as mp, sys, time
 
 STATUS = "/run/msi-aio-fancontrol/status.json"
 BURSTS = [float(x) for x in sys.argv[1:]] or [2.0, 8.0]
-IDLE_FANS = 28  # settled when the radiator fans are at or below this duty
+IDLE_FANS = 30  # settled when the radiator fans are at or below this duty
 OBSERVE = 40  # seconds observed after each burst
 
 

@@ -32,9 +32,9 @@ from liquidctl.driver.msi import _FanConfig, _FanMode, _FanTempConfig
 # stores only 4 points and holds the last duty above the last temperature, so the
 # last point must be 100 %.  Hardware limits: radiator fans 20-100 %, pump 60-100 %
 # (the device refuses to go lower), water block fan 0-100 %.
-FANS = [(40, 25), (58, 35), (72, 60), (85, 100)]
-WATERBLOCK = [(40, 30), (58, 38), (72, 60), (85, 100)]
-PUMP = [(40, 60), (58, 68), (72, 86), (85, 100)]
+FANS = [(40, 25), (58, 33), (78, 55), (90, 100)]
+WATERBLOCK = [(40, 30), (58, 36), (78, 55), (90, 100)]
+PUMP = [(40, 60), (58, 66), (78, 82), (90, 100)]
 CURVES = {0: FANS, 1: FANS, 2: FANS, 3: WATERBLOCK, 4: PUMP}
 MIN_DUTY = {0: 20, 1: 20, 2: 20, 3: 0, 4: 60}
 

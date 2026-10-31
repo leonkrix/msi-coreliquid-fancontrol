@@ -21,11 +21,13 @@ CPU temperature (Tctl) to duty, interpolated linearly by the cooler:
 | Tctl | radiator fans | water block fan | pump |
 |---|---|---|---|
 | up to 40 °C | 25 % | 30 % | 60 % |
-| 58 °C | 35 % | 38 % | 68 % |
-| 72 °C | 60 % | 60 % | 86 % |
-| 85 °C | 100 % | 100 % | 100 % |
+| 58 °C | 33 % | 36 % | 66 % |
+| 78 °C | 55 % | 55 % | 82 % |
+| 90 °C | 100 % | 100 % | 100 % |
 
-At idle (Tctl 40-45 °C) that is about 650-700 rpm on the radiator fans and about 2000 rpm on the pump. The values are constants at the top of [`msi-aio-fancontrol`](msi-aio-fancontrol); edit them and restart the service.
+For example, the radiator fans run at 46 % at 70 °C, 52 % at 75 °C, 62 % at 80 °C and 81 % at 85 °C. At idle (Tctl 40-50 °C) that is about 650-800 rpm on the radiator fans and about 2000 rpm on the pump. The values are constants at the top of [`msi-aio-fancontrol`](msi-aio-fancontrol); edit them and restart the service.
+
+The curve is deliberately gentle below 80 °C: the CPU is specified for 90 °C and limits its own clock there, so the fans only reach full speed at 90 °C. If you prefer more margin under long full load, move the last point to a lower temperature, for example 85 or 88 °C.
 
 ### Things learned about the K360
 
@@ -42,10 +44,12 @@ The filter has a 10 s time constant when the temperature rises and 3 s when it f
 
 | load | radiator fans (idle value, peak) | Tctl peak |
 |---|---|---|
-| 2 s | 28 % to 35 % | 80 °C |
-| 8 s | 27 % to 56 % | 89 °C |
+| 2 s | 29 % to 38 % | 82 °C |
+| 8 s | 30 % to 50 % | 90 °C |
 
-With the earlier, faster filter (5 s up, 6 s down) the same 2 s burst took the fans to 42 % and 8 s to 71 %. After a burst, the fans need around 20-35 s to settle again. The cooler's own slew and the time the CPU needs to cool down set that, not the filter. [`tools/burst_test.py`](tools/burst_test.py) reproduces the measurement. It reads only the status file and the CPU sensor.
+These numbers are with the current curves. With the earlier, steeper curves (100 % at 85 °C) the same bursts took the fans to 35 % and 56 %, and with an even faster filter (5 s up, 6 s down) to 42 % and 71 %.
+
+After a burst, the fans need around 20-35 s to settle again (about 23 s after the 8 s burst). The cooler's own slew and the time the CPU needs to cool down set that, not the filter. [`tools/burst_test.py`](tools/burst_test.py) reproduces the measurement. It reads only the status file and the CPU sensor.
 
 ## Install
 
@@ -70,7 +74,7 @@ Try the script by hand without touching the cooler: `python3 -I msi-aio-fancontr
 ## Notes and limits
 
 - **Do not run `liquidctl` against the cooler while the service is running.** Replies from the device get mixed up and either side can time out. Stop the service first (`sudo systemctl stop msi-aio-fancontrol`) or read the status file.
-- **When the service stops**, it sends 80 °C and the cooler stays at that operating point (fans about 85 %, pump about 95 %), so it cannot be left cool by mistake. If the process is killed with `SIGKILL` the cooler keeps whatever it was last told.
+- **When the service stops**, it sends 80 °C and the cooler stays at that operating point (fans about 62 %, pump about 85 %, roughly what the cooler did by default before), so it cannot be left cool by mistake. If the process is killed with `SIGKILL` the cooler keeps whatever it was last told.
 - **If the CPU temperature cannot be read**, the service reports 90 °C and the cooler ramps up.
 - The cooler loses its settings when it loses power. The service checks every 30 s that the curves are still stored and re-applies them if not.
 - The display can be changed with `DISPLAY` in the script. Valid items: `cpu_temp`, `cpu_freq`, `gpu_freq`, `gpu_usage`, `fan_pump`, `fan_radiator`, `fan_cpumos`. This service only feeds CPU values. The temperature on the display is the filtered one.
